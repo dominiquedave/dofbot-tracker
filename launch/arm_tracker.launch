@@ -1,0 +1,23 @@
+<launch>
+    <!-- Dofbot Pi Arm Color Tracker -->
+    <!-- This launch file starts the arm tracker node with default parameters -->
+
+    <node name="dofbot_arm_tracker" pkg="dofbot_tracker" type="dofbot_arm_tracker.py" output="screen">
+
+        <!-- Servo IDs -->
+        <param name="pan_servo_id" value="1" />
+        <param name="tilt_servo_id" value="2" />
+
+        <!-- Tracking parameters -->
+        <param name="tracking_deadzone" value="20" />
+        <param name="max_pan_angle" value="180" />
+        <param name="max_tilt_angle" value="180" />
+
+        <!-- PID gains for tracking (proportional control) -->
+        <!-- Lower values = slower, smoother tracking -->
+        <!-- Higher values = faster, more aggressive tracking -->
+        <param name="pan_gain" value="0.5" />
+        <param name="tilt_gain" value="0.5" />
+
+    </node>
+</launch>
