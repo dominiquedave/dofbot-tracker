@@ -188,11 +188,11 @@ class TrackingController:
             tilt_up_angle = 5 - tilt_offset
             tilt_up_angle = max(5, min(60, tilt_up_angle))
 
-        # Debug logging for tilt tracking
-        print(f"[Controller] y_error={y_error:6.1f}, tilt_down={tilt_down_angle:6.1f}°, tilt_up={tilt_up_angle:6.1f}°")
-
-        # Log what will be sent to servo
-        print(f"[Controller] COMMAND: pan_angle={int(pan_angle)}, tilt_down={int(tilt_down_angle)}, tilt_up={int(tilt_up_angle)}")
+        if self.config.debug:
+            print(f"[Controller] y_error={y_error:6.1f}, "
+                  f"tilt_down={tilt_down_angle:6.1f}°, tilt_up={tilt_up_angle:6.1f}°")
+            print(f"[Controller] COMMAND: pan_angle={int(pan_angle)}, "
+                  f"tilt_down={int(tilt_down_angle)}, tilt_up={int(tilt_up_angle)}")
 
         # Step 6: Clamp pan angle to valid servo range [0, 180]
         pan_angle = max(0, min(180, pan_angle))

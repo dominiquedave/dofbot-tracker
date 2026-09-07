@@ -4,10 +4,31 @@ A ROS package for tracking colored objects with the Dofbot Pi 6-DOF robotic arm.
 
 ## Overview
 
-This package provides a ROS node that:
-1. Subscribes to `/Current_point` from the color tracker
-2. Controls the arm servos via I2C to track objects continuously
-3. Supports manual control override via `/JoyState`
+Two ROS nodes, split along the perception / control seam:
+
+```
+  camera ──> color_tracker ──/Current_point──> dofbot_arm_tracker ──I2C──> servos
+                                                      ^
+                                              /JoyState (pause)
+```
+
+- **`color_tracker_node.py`** detects a colour-selected object and publishes
+  its pixel position.
+- **`dofbot_arm_tracker.py`** turns that position into servo angles.
+
+Neither node contains control maths or I2C code. Those live in reusable
+modules, so the same behaviour runs with or without a ROS master:
+
+| Module | Responsibility |
+|--------|----------------|
+| `vision_lib.py` | camera, ROI selection, colour learning, detection, display |
+| `tracker_controller.py` | smoothing, proportional control, deadzone, rate limiting |
+| `tracker_config.py` | every tuning parameter, validated in one dataclass |
+| `dofbot_lib.py` | servo I2C driver (write angles, read positions) |
+
+That split is the point: `test_vision_processor.py` exercises detection with
+no arm attached, and `test_standalone_tracker.py` runs the whole loop with no
+ROS master.
 
 ## Hardware
 
@@ -71,81 +92,112 @@ roslaunch dofbot_tracker arm_tracker.launch
 
 ## Usage
 
-### Quick Start
+Run inside the `dofbot` container (`bash ~/Docker_Ros.sh`).
 
-1. **Start the color tracker** (provides object position):
+**Stop the vendor arm service first.** `YahboomArm.pyc` also writes to I2C
+`0x15`, and I2C reports no error for two writers - the arm simply fights
+itself:
+
 ```bash
-roscore
-rosrun yahboomcar_astra colorHSV.py
+pkill -f YahboomArm
 ```
-- Click and drag to select a colored region
-- Press SPACE to start tracking
-- Note: The colorHSV node publishes to `/Current_point`
 
-2. **Start the arm tracker**:
+### Both nodes at once
+
 ```bash
-# Using launch file
 roslaunch dofbot_tracker arm_tracker.launch
-
-# Or directly
-rosrun dofbot_tracker dofbot_arm_tracker.py
 ```
 
-### Testing the Arm (Standalone)
+Drag a box around a coloured object in the window, press SPACE, and the arm
+tracks it. Press `r` to pick a different colour, `q` to quit.
 
-Test the arm controller without ROS:
+Override tuning without editing files:
+
 ```bash
-# Move servo 1 (pan) to 90 degrees
-python3 ~/robot/dofbot-tracker/nodes/dofbot_lib.py --servo 1 --angle 90
-
-# Run a sequence of angles
-python3 dofbot_lib.py --servo 1 --sequence 0 45 90 135 180
+roslaunch dofbot_tracker arm_tracker.launch pan_gain:=0.3 tracking_deadzone:=40
+roslaunch dofbot_tracker arm_tracker.launch frame_width:=640 frame_height:=480
 ```
 
-### ROS Parameters
+### Nodes individually
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `pan_servo_id` | 1 | Servo ID for pan (base rotation) |
-| `tilt_servo_id` | 2 | Servo ID for tilt (shoulder) |
-| `tracking_deadzone` | 20 | Pixels of tolerance before moving |
-| `max_pan_angle` | 180 | Maximum pan angle (0-180) |
-| `max_tilt_angle` | 180 | Maximum tilt angle (0-180) |
-| `pan_gain` | 0.5 | Proportional gain for pan (higher = faster) |
-| `tilt_gain` | 0.5 | Proportional gain for tilt (higher = faster) |
-
-### Tuning the Tracker
-
-**If the arm is too slow/slaggy:**
 ```bash
-# Increase the gains
-rosrun dofbot_tracker dofbot_arm_tracker.py _pan_gain:=1.0 _tilt_gain:=1.0
+rosrun dofbot_tracker color_tracker_node.py      # perception only
+rosrun dofbot_tracker dofbot_arm_tracker.py      # control only
 ```
 
-**If the arm osculates/over-shoots:**
+Useful for driving the arm from synthetic positions with no camera:
+
 ```bash
-# Decrease the gains
-rosrun dofbot_tracker dofbot_arm_tracker.py _pan_gain:=0.2 _tilt_gain:=0.2
+rostopic pub -r 5 /Current_point yahboomcar_msgs/Position \
+    "{angleX: 260.0, angleY: 120.0, distance: 20.0}"
 ```
 
-**If the arm is always moving even when object is stationary:**
+### Without ROS
+
 ```bash
-# Increase the deadzone
-rosrun dofbot_tracker dofbot_arm_tracker.py _tracking_deadzone:=40
+python3 nodes/test_standalone_tracker.py    # whole loop, no master
+python3 nodes/test_vision_processor.py      # detection only, no arm
+python3 nodes/test_tilt.py                  # tilt servo pair
+python3 nodes/test_read_angle.py            # read all six angles
+python3 nodes/dofbot_lib.py --servo 1 --angle 90 --time 400
 ```
+
+## Parameters
+
+Set on the launch file (`name:=value`) or per node (`_name:=value`).
+Defaults come from `TrackerConfig`.
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `frame_width` / `frame_height` | 320 / 240 | camera resolution. **Both nodes must agree** - see below |
+| `pan_gain` | 0.18 | horizontal response. Higher = faster, oscillates above ~0.3 |
+| `tilt_gain` | 0.18 | vertical response |
+| `smoothing_alpha` | 0.3 | EMA filter. 0 = smooth and slow, 1 = responsive and jittery |
+| `tracking_deadzone` | 20 | pixels of error tolerated before moving |
+| `servo_update_interval` | 0.2 | seconds between servo commands |
+| `servo_move_time_ms` | 400 | commanded duration of each movement |
+| `show_window` | true | false runs headless; then `hsv_min`/`hsv_max` are required |
+| `debug` | false | per-update console logging |
+
+**Frame size must match across the two nodes.** The arm node measures its
+error from the frame centre, so a vision node publishing 320-wide positions
+into an arm node assuming 640 puts the centre off by 160 px - the arm slews
+to one side and stays there. The launch file declares it once and passes it
+to both for exactly this reason.
+
+### Tuning
+
+| Symptom | Change |
+|---------|--------|
+| sluggish | raise `pan_gain` / `tilt_gain` |
+| overshoots, oscillates | lower the gains, or lower `smoothing_alpha` |
+| fidgets while object is still | raise `tracking_deadzone` |
+| jerky in steps | lower `servo_update_interval` |
 
 ## ROS Topics
 
-### Subscribed Topics
+### Published by `color_tracker`
 
 | Topic | Type | Description |
 |-------|------|-------------|
-| `/Current_point` | `yahboomcar_msgs/Position` | Object position (angleX, angleY, distance) |
-| `/JoyState` | `std_msgs/Bool` | Manual control override (true = pause tracking) |
+| `/Current_point` | `yahboomcar_msgs/Position` | `angleX` = x px, `angleY` = y px, `distance` = radius px |
+| `/tracker/detected` | `std_msgs/Bool` | latched; published on acquire/lose transitions only |
 
-### Published Topics
+### Subscribed by `dofbot_arm_tracker`
 
-None - the node only controls servos via I2C.
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/Current_point` | `yahboomcar_msgs/Position` | object position |
+| `/JoyState` | `std_msgs/Bool` | true pauses auto tracking; smoothing state resets on release |
+
+Inspect it live:
+
+```bash
+rostopic echo /Current_point
+rostopic hz /Current_point
+rosnode info /dofbot_arm_tracker
+rqt_graph
+```
 
 ## Working with the Full 6-DOF Arm
 

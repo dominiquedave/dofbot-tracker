@@ -1,372 +1,150 @@
 #!/usr/bin/env python3
 """
-Dofbot Pi Arm Color Tracker - ROS Node
+Dofbot Arm Tracker ROS Node
 
-This node subscribes to /Current_point from the color tracker and controls
-the Dofbot Pi 6-DOF arm to track colored objects continuously.
+Subscribes to object positions and drives the arm to keep the object centred.
+This is the control half of the tracker; color_tracker_node.py produces the
+positions it consumes.
 
-ROS Subscription:
-    - /Current_point (yahboomcar_msgs/Position): Object position data
-    - /JoyState (std_msgs/Bool): Manual control override
+This node deliberately owns no control maths and no I2C code. Smoothing,
+proportional control, deadzone and rate limiting live in TrackingController;
+servo I/O lives in dofbot_lib.ArmController. The node's whole job is to
+translate between ROS and those components, so the same behaviour can be
+exercised without a ROS master by test_standalone_tracker.py.
 
-ROS Parameters:
-    - ~pan_servo_id (int): Servo ID for pan movement (default: 1)
-    - ~tracking_deadzone (int): Deadzone for object position (default: 20)
-    - ~max_pan_angle (float): Maximum pan angle in degrees (default: 180)
-    - ~max_tilt_angle (float): Maximum tilt angle in degrees (default: 180)
-    - ~pan_gain (float): Proportional gain for pan control (default: 0.18)
-    - ~tilt_gain (float): Proportional gain for tilt control (default: 0.18)
+Subscribed topics:
+    /Current_point     (yahboomcar_msgs/Position)  object position in pixels
+    /JoyState          (std_msgs/Bool)             true pauses auto tracking
 
-Note: Tilt uses two servos - Servo 3 (start: 90°) for downward tilt and
-Servo 4 (start: 5°) for upward tilt. Both are mechanically reversed.
+Parameters (defaults come from TrackerConfig):
+    ~frame_width  ~frame_height     must match the vision node, since the
+                                    control error is measured from frame centre
+    ~pan_gain  ~tilt_gain  ~smoothing_alpha  ~tracking_deadzone
+    ~servo_update_interval  ~servo_move_time_ms
+    ~pan_servo_id
+    ~debug                          per-update console logging
 
-Usage:
-    rosrun dofbot_tracker dofbot_arm_tracker.py
+Tilt uses two servos: servo 3 (rest 90, range 40-90) tilts down and servo 4
+(rest 5, range 5-60) tilts up. Both are mechanically reversed; dofbot_lib
+handles the inversion, so angles here are ordinary 0-180 values.
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import rospy
-import numpy as np
-from yahboomcar_msgs.msg import Position
 from std_msgs.msg import Bool
-from std_msgs.msg import Int32
+from yahboomcar_msgs.msg import Position
 
+from dofbot_lib import ArmController
+from tracker_config import TrackerConfig
+from tracker_controller import TrackingController
 
-class ArmController:
-    """
-    Dofbot Pi Arm Controller using I2C communication.
-
-    This class provides a simplified interface to control the arm servos.
-    It handles the I2C communication and angle-to-position conversion.
-
-    I2C Details:
-        - Address: 0x15
-        - Bus: 1 (Raspberry Pi)
-        - Servos: 1-6 (Servo 5 has 0-270° range)
-    """
-
-    # Servo position range (pulse width in microseconds * 4 for 12-bit resolution)
-    # Standard servos: 900-3100 (0-180°)
-    # Servo 5 (extended): 380-3700 (0-270°)
-    SERVO_MIN = 900
-    SERVO_MAX = 3100
-    SERVO5_MIN = 380
-    SERVO5_MAX = 3700
-
-    def __init__(self, servo_id=1):
-        """
-        Initialize the arm controller.
-
-        Args:
-            servo_id: The servo ID to control (1-6)
-        """
-        self.servo_id = servo_id
-        self.current_angle = 90  # Default start position
-
-        # Import smbus for I2C communication
-        try:
-            import smbus
-            self.bus = smbus.SMBus(1)
-            self.addr = 0x15
-            self.initialized = True
-            rospy.loginfo(f"ArmController: Initialized servo {servo_id} on I2C address 0x15")
-        except ImportError:
-            rospy.logwarn("ArmController: smbus not available - running in simulation mode")
-            self.bus = None
-            self.initialized = False
-        except Exception as e:
-            rospy.logwarn(f"ArmController: Failed to initialize I2C: {e} - running in simulation mode")
-            self.bus = None
-            self.initialized = False
-
-    def angle_to_position(self, angle):
-        """
-        Convert angle to servo position value.
-
-        Args:
-            angle: Target angle in degrees
-
-        Returns:
-            Position value for I2C communication
-        """
-        if self.servo_id == 5:
-            # Servo 5 has extended range (0-270°)
-            position = int((self.SERVO5_MAX - self.SERVO5_MIN) * (angle - 0) / (270 - 0) + self.SERVO5_MIN)
-        else:
-            # Standard servos (1,2,3,4,6) have 0-180° range
-            # Note: servos 2,3,4 are mechanically reversed
-            if self.servo_id in [2, 3, 4]:
-                angle = 180 - angle
-            position = int((self.SERVO_MAX - self.SERVO_MIN) * (angle - 0) / (180 - 0) + self.SERVO_MIN)
-
-        return max(self.SERVO_MIN, min(self.SERVO_MAX, position))
-
-    def write_angle(self, angle, time=100):
-        """
-        Write angle to servo.
-
-        Args:
-            angle: Target angle in degrees
-            time: Movement duration in milliseconds (optional)
-        """
-        if not self.initialized:
-            return
-
-        # Clamp angle to valid range
-        if self.servo_id == 5:
-            angle = max(0, min(270, angle))
-        else:
-            angle = max(0, min(180, angle))
-
-        # Convert to position
-        position = self.angle_to_position(angle)
-
-        # Calculate high and low bytes
-        value_H = (position >> 8) & 0xFF
-        value_L = position & 0xFF
-        time_H = (time >> 8) & 0xFF
-        time_L = time & 0xFF
-
-        try:
-            # Write to I2C: command register 0x10 + servo_id
-            self.bus.write_i2c_block_data(self.addr, 0x10 + self.servo_id,
-                                         [value_H, value_L, time_H, time_L])
-            self.current_angle = angle
-        except Exception as e:
-            rospy.logdebug(f"ArmController: I2C write error: {e}")
-
-    def move_to_center(self, time=200):
-        """Move servo to center position (90°)."""
-        self.write_angle(90, time)
+TILT_DOWN_SERVO = 3   # rest 90 deg
+TILT_UP_SERVO = 4     # rest 5 deg
+TILT_DOWN_REST = 90
+TILT_UP_REST = 5
 
 
 class DofbotArmTracker:
-    """
-    Dofbot Pi Arm Tracker - Main tracking logic.
-
-    This node subscribes to object position data and controls the arm servos
-    to track the object. It uses a simple proportional controller for smooth
-    tracking movement.
-
-    The tracking works as follows:
-    1. Subscribe to /Current_point topic for object position (X, Y, radius)
-    2. Calculate offset from image center (320, 240 for 640x480)
-    3. Apply proportional control to determine servo angles
-    4. Send angle commands to servos via I2C
-    """
+    """Drives pan and dual-servo tilt to centre the tracked object."""
 
     def __init__(self):
-        """Initialize the arm tracker node."""
-        rospy.init_node('dofbot_arm_tracker', anonymous=True)
+        rospy.init_node("dofbot_arm_tracker", anonymous=False)
 
-        # Get parameters
-        self.pan_servo_id = rospy.get_param('~pan_servo_id', 1)
-        self.tilt_servo_id = rospy.get_param('~tilt_servo_id', 3)  # Changed from 2 to 3
-        self.deadzone = rospy.get_param('~tracking_deadzone', 20)
-        self.max_pan_angle = rospy.get_param('~max_pan_angle', 180)
-        self.max_tilt_angle = rospy.get_param('~max_tilt_angle', 180)
-        self.pan_gain = rospy.get_param('~pan_gain', 0.18)  # Changed from 0.5 for stability
-        self.tilt_gain = rospy.get_param('~tilt_gain', 0.18)  # Changed from 0.5 for stability
+        defaults = TrackerConfig()
+        self.config = TrackerConfig(
+            frame_width=rospy.get_param("~frame_width", defaults.frame_width),
+            frame_height=rospy.get_param("~frame_height", defaults.frame_height),
+            deadzone=rospy.get_param("~tracking_deadzone", defaults.deadzone),
+            pan_gain=rospy.get_param("~pan_gain", defaults.pan_gain),
+            tilt_gain=rospy.get_param("~tilt_gain", defaults.tilt_gain),
+            smoothing_alpha=rospy.get_param("~smoothing_alpha", defaults.smoothing_alpha),
+            servo_update_interval=rospy.get_param(
+                "~servo_update_interval", defaults.servo_update_interval),
+            servo_move_time_ms=rospy.get_param(
+                "~servo_move_time_ms", defaults.servo_move_time_ms),
+            pan_servo_id=rospy.get_param("~pan_servo_id", defaults.pan_servo_id),
+            debug=rospy.get_param("~debug", False),
+        )
 
-        # Image dimensions (matching color tracker)
-        self.image_width = 640
-        self.image_height = 480
-        self.center_x = self.image_width / 2
-        self.center_y = self.image_height / 2
+        self.controller = TrackingController(self.config)
+        self.pan = ArmController(self.config.pan_servo_id)
+        self.tilt_down = ArmController(TILT_DOWN_SERVO)
+        self.tilt_up = ArmController(TILT_UP_SERVO)
 
-        # Initialize servos
-        self.pan_controller = ArmController(self.pan_servo_id)
-        # Tilt uses two servos: Servo 3 for downward tilt, Servo 4 for upward tilt
-        self.tilt_down_controller = ArmController(3)  # Servo 3 (mechanically reversed)
-        self.tilt_up_controller = ArmController(4)    # Servo 4 (mechanically reversed)
-
-        # Current object position
-        self.object_x = 0
-        self.object_y = 0
-        self.object_radius = 0
-
-        # Tracking state
-        self.tracking_enabled = True
         self.joy_active = False
 
-        # Subscriber callbacks use rospy Timer for periodic updates
-        self.last_update_time = rospy.get_time()
-        self.update_interval = 0.1  # 100ms update rate
+        rospy.loginfo("dofbot_arm_tracker configuration:")
+        rospy.loginfo("  frame        %dx%d (centre %.0f,%.0f)",
+                      self.config.frame_width, self.config.frame_height,
+                      self.config.center_x, self.config.center_y)
+        rospy.loginfo("  pan servo    %d", self.config.pan_servo_id)
+        rospy.loginfo("  tilt servos  %d (down, rest %d) / %d (up, rest %d)",
+                      TILT_DOWN_SERVO, TILT_DOWN_REST, TILT_UP_SERVO, TILT_UP_REST)
+        rospy.loginfo("  gains        pan=%.2f tilt=%.2f alpha=%.2f",
+                      self.config.pan_gain, self.config.tilt_gain,
+                      self.config.smoothing_alpha)
+        rospy.loginfo("  deadzone     %d px, update every %.2fs",
+                      self.config.deadzone, self.config.servo_update_interval)
 
-        # Logging configuration
-        rospy.loginfo("Dofbot Arm Tracker Configuration:")
-        rospy.loginfo(f"  Pan Servo ID: {self.pan_servo_id}")
-        rospy.loginfo(f"  Tilt Down Servo: 3 (90° start)")
-        rospy.loginfo(f"  Tilt Up Servo: 4 (5° start)")
-        rospy.loginfo(f"  Deadzone: {self.deadzone} pixels")
-        rospy.loginfo(f"  Pan Gain: {self.pan_gain}")
-        rospy.loginfo(f"  Tilt Gain: {self.tilt_gain}")
-        rospy.loginfo("  Waiting for object position data...")
+        self.go_to_rest(move_time_ms=500)
 
-        # Setup ROS subscriptions
-        self.sub_position = rospy.Subscriber(
-            '/Current_point', Position, self.position_callback, queue_size=1
-        )
-        self.sub_joy = rospy.Subscriber(
-            '/JoyState', Bool, self.joy_callback, queue_size=1
-        )
+        rospy.Subscriber("/Current_point", Position, self.on_position, queue_size=1)
+        rospy.Subscriber("/JoyState", Bool, self.on_joy, queue_size=1)
+        rospy.on_shutdown(self.shutdown)
 
-        # Setup timer for periodic tracking updates
-        self.tracking_timer = rospy.Timer(
-            rospy.Duration(self.update_interval),
-            self.tracking_callback
-        )
+        rospy.loginfo("waiting for /Current_point ...")
 
-        # Cleanup handler
-        rospy.on_shutdown(self.shutdown_handler)
+    def go_to_rest(self, move_time_ms=300):
+        """Park pan centred and both tilt servos at their rest angles."""
+        self.pan.write_angle(90, move_time_ms)
+        self.tilt_down.write_angle(TILT_DOWN_REST, move_time_ms)
+        self.tilt_up.write_angle(TILT_UP_REST, move_time_ms)
 
-        # Initialize servos to starting positions:
-        # Pan (Servo 1): 90°, Tilt Down (Servo 3): 90°, Tilt Up (Servo 4): 5°
-        rospy.sleep(0.5)
-        self.pan_controller.write_angle(90, time=500)
-        self.tilt_down_controller.write_angle(90, time=500)
-        self.tilt_up_controller.write_angle(5, time=500)
-        rospy.sleep(0.5)
-
-        rospy.loginfo("Dofbot Arm Tracker initialized successfully!")
-
-    def position_callback(self, msg):
-        """
-        Callback for object position messages.
-
-        Args:
-            msg: Position message containing:
-                - angleX: Object X position (pixels from left)
-                - angleY: Object Y position (pixels from top)
-                - distance: Object distance/size
-        """
-        if not isinstance(msg, Position):
+    def on_joy(self, msg):
+        """Manual control takes priority; drop smoothing state on release."""
+        if msg.data == self.joy_active:
             return
-
-        self.object_x = msg.angleX
-        self.object_y = msg.angleY
-        self.object_radius = msg.distance
-
-        # Log occasionally (every 10th update to avoid spam)
-        if rospy.get_time() - self.last_update_time > 1.0:
-            rospy.logdebug(f"Object detected: X={self.object_x:.1f}, Y={self.object_y:.1f}, R={self.object_radius:.1f}")
-            self.last_update_time = rospy.get_time()
-
-    def joy_callback(self, msg):
-        """
-        Callback for joystick/manual control state.
-
-        Args:
-            msg: Bool message - True if manual control is active
-        """
-        if not isinstance(msg, Bool):
-            return
-
         self.joy_active = msg.data
-
         if self.joy_active:
-            rospy.loginfo("Manual control activated - pausing auto tracking")
+            rospy.loginfo("manual control active - auto tracking paused")
         else:
-            rospy.loginfo("Manual control deactivated - resuming auto tracking")
+            # Stale smoothed positions would cause a jump on resume.
+            self.controller.reset()
+            rospy.loginfo("manual control released - auto tracking resumed")
 
-    def tracking_callback(self, event):
-        """
-        Periodic tracking update callback.
-
-        This is called at a fixed interval (e.g., 100ms) to update
-        the arm position based on the latest object position.
-
-        Args:
-            event: Timer event (automatically passed by ROS)
-        """
-        # Don't track if manual control is active
+    def on_position(self, msg):
+        """Turn an object position into a servo command, if one is due."""
         if self.joy_active:
             return
 
-        # Don't track if no object detected
-        if self.object_x == 0 and self.object_y == 0:
-            return
+        command = self.controller.update(int(msg.angleX), int(msg.angleY))
+        if not command.should_update:
+            return  # in deadzone, or rate limited
 
-        # Calculate position error (offset from image center)
-        x_error = self.object_x - self.center_x
-        y_error = self.object_y - self.center_y
+        self.pan.write_angle(command.pan_angle, command.move_time_ms)
+        self.tilt_down.write_angle(command.tilt_down_angle, command.move_time_ms)
+        self.tilt_up.write_angle(command.tilt_up_angle, command.move_time_ms)
 
-        # Check if we need to move (deadzone)
-        if abs(x_error) < self.deadzone and abs(y_error) < self.deadzone:
-            return
+        rospy.logdebug("pan=%d tilt_down=%d tilt_up=%d",
+                       command.pan_angle, command.tilt_down_angle, command.tilt_up_angle)
 
-        # Apply exponential moving average (EMA) smoothing to Y position
-        # This reduces jittery movements in tilt tracking
-        if not hasattr(self, 'filtered_y'):
-            self.filtered_y = self.center_y
-        self.filtered_y = self.tilt_gain * self.object_y + (1 - self.tilt_gain) * self.filtered_y
-
-        # Calculate filtered Y error from center
-        y_error_filtered = self.filtered_y - self.center_y
-
-        # Tilt control logic using two servos:
-        # - Servo 3 (tilt_down): 90° start, moves to 40° for downward tilt
-        # - Servo 4 (tilt_up): 5° start, moves to 60° for upward tilt
-        # Both servos are mechanically reversed
-
-        if y_error_filtered > self.deadzone:
-            # Object is below center - move arm UP (tilt down with Servo 3)
-            # y_error is positive when object is below center
-            # To move arm UP, we need to reduce Servo 3 angle (mechanically reversed)
-            tilt_down_angle = 90 - (y_error_filtered * self.pan_gain)  # Use pan_gain for tilt too
-            tilt_down_angle = max(40, min(90, tilt_down_angle))  # Clamp: 40-90°
-            self.tilt_down_controller.write_angle(int(tilt_down_angle), time=100)
-            self.tilt_up_controller.write_angle(5, time=100)  # Reset Servo 4
-            rospy.logdebug(f"Tilt UP: Y_err={y_error_filtered:+.1f} -> Servo3={tilt_down_angle:.1f}°")
-        elif y_error_filtered < -self.deadzone:
-            # Object is above center - move arm DOWN (tilt up with Servo 4)
-            # y_error is negative when object is above center
-            # To move arm DOWN, we need to increase Servo 4 angle (mechanically reversed)
-            tilt_up_angle = 5 - (y_error_filtered * self.pan_gain)  # Negative * Negative = positive
-            tilt_up_angle = max(5, min(60, tilt_up_angle))  # Clamp: 5-60°
-            self.tilt_up_controller.write_angle(int(tilt_up_angle), time=100)
-            self.tilt_down_controller.write_angle(90, time=100)  # Reset Servo 3
-            rospy.logdebug(f"Tilt DOWN: Y_err={y_error_filtered:+.1f} -> Servo4={tilt_up_angle:.1f}°")
-        else:
-            # In deadzone - return both servos to start positions
-            self.tilt_down_controller.write_angle(90, time=100)
-            self.tilt_up_controller.write_angle(5, time=100)
-            rospy.logdebug("Tilt: In deadzone - returning to start")
-
-        # Update pan servo (unchanged)
-        pan_offset = x_error * self.pan_gain
-        pan_angle = 90 + pan_offset
-        pan_angle = max(0, min(self.max_pan_angle, pan_angle))
-        self.pan_controller.write_angle(int(pan_angle), time=100)
-
-        # Log occasionally
-        if rospy.get_time() - self.last_update_time > 1.0:
-            rospy.logdebug(f"Tracking: X_err={x_error:+.1f}, Y_err={y_error_filtered:+.1f} -> "
-                          f"Pan={pan_angle:.1f}°")
-            self.last_update_time = rospy.get_time()
-
-    def shutdown_handler(self):
-        """ROS shutdown handler - clean up servos."""
-        rospy.loginfo("Shutting down Dofbot Arm Tracker...")
-        self.pan_controller.move_to_center()
-        # Return tilt servos to start positions
-        self.tilt_down_controller.write_angle(90, time=300)
-        self.tilt_up_controller.write_angle(5, time=300)
-        rospy.sleep(0.2)
-        rospy.loginfo("ArmTracker shutdown complete.")
+    def shutdown(self):
+        rospy.loginfo("dofbot_arm_tracker shutting down - parking arm")
+        self.go_to_rest(move_time_ms=500)
+        rospy.sleep(0.6)
 
 
 def main():
-    """Main entry point for the arm tracker node."""
     try:
-        tracker = DofbotArmTracker()
+        DofbotArmTracker()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
-    except Exception as e:
-        rospy.logerr(f"Fatal error in DofbotArmTracker: {e}")
-        import traceback
-        traceback.print_exc()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

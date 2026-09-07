@@ -1,23 +1,49 @@
 <launch>
-    <!-- Dofbot Pi Arm Color Tracker -->
-    <!-- This launch file starts the arm tracker node with default parameters -->
+    <!-- Dofbot colour tracker: perception node + arm control node.
 
-    <node name="dofbot_arm_tracker" pkg="dofbot_tracker" type="dofbot_arm_tracker.py" output="screen">
+         Frame size is declared once here and passed to BOTH nodes. The arm
+         node measures its control error from the frame centre, so if the two
+         disagree the arm drives hard toward one side and stays there. Do not
+         set them separately. -->
 
-        <!-- Servo IDs -->
-        <param name="pan_servo_id" value="1" />
-        <param name="tilt_servo_id" value="2" />
+    <arg name="frame_width"  default="320" />
+    <arg name="frame_height" default="240" />
 
-        <!-- Tracking parameters -->
-        <param name="tracking_deadzone" value="20" />
-        <param name="max_pan_angle" value="180" />
-        <param name="max_tilt_angle" value="180" />
+    <!-- Set false to run without the OpenCV window; then hsv_min/hsv_max
+         must be supplied, since there is no way to pick a colour by hand. -->
+    <arg name="show_window"  default="true" />
 
-        <!-- PID gains for tracking (proportional control) -->
-        <!-- Lower values = slower, smoother tracking -->
-        <!-- Higher values = faster, more aggressive tracking -->
-        <param name="pan_gain" value="0.5" />
-        <param name="tilt_gain" value="0.5" />
+    <!-- Control tuning. Raise gains for faster tracking, lower them if the
+         arm oscillates. Raise the deadzone if it fidgets while the object
+         is still. -->
+    <arg name="pan_gain"          default="0.18" />
+    <arg name="tilt_gain"         default="0.18" />
+    <arg name="smoothing_alpha"   default="0.3" />
+    <arg name="tracking_deadzone" default="20" />
+    <arg name="debug"             default="false" />
 
+    <!-- Perception: publishes /Current_point -->
+    <node name="color_tracker" pkg="dofbot_tracker"
+          type="color_tracker_node.py" output="screen">
+        <param name="frame_width"  value="$(arg frame_width)" />
+        <param name="frame_height" value="$(arg frame_height)" />
+        <param name="show_window"  value="$(arg show_window)" />
+        <param name="publish_rate" value="30.0" />
+    </node>
+
+    <!-- Control: subscribes to /Current_point, drives the servos -->
+    <node name="dofbot_arm_tracker" pkg="dofbot_tracker"
+          type="dofbot_arm_tracker.py" output="screen">
+        <param name="frame_width"  value="$(arg frame_width)" />
+        <param name="frame_height" value="$(arg frame_height)" />
+
+        <param name="pan_servo_id"          value="1" />
+        <param name="pan_gain"              value="$(arg pan_gain)" />
+        <param name="tilt_gain"             value="$(arg tilt_gain)" />
+        <param name="smoothing_alpha"       value="$(arg smoothing_alpha)" />
+        <param name="tracking_deadzone"     value="$(arg tracking_deadzone)" />
+        <param name="servo_update_interval" value="0.2" />
+        <param name="servo_move_time_ms"    value="400" />
+        <param name="debug"                 value="$(arg debug)" />
     </node>
 </launch>

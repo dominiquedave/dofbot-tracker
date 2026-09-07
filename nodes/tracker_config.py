@@ -69,6 +69,12 @@ class TrackerConfig:
     brightness_threshold_low: int = 100    # avg brightness below this: use loose tolerances
     brightness_threshold_high: int = 200   # avg brightness above this: use tight tolerances
 
+    # DIAGNOSTICS
+    # Per-update console logging. Useful when driving the tracker by hand,
+    # far too noisy under ROS (the controller runs on every message), so
+    # nodes leave this off and log through rospy instead.
+    debug: bool = False
+
     def __post_init__(self):
         """
         Validate configuration after initialization.
