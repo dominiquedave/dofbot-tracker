@@ -19,266 +19,257 @@ import numpy as np
 import time
 import sys
 
-# Import the arm controller
+# Import the components
 sys.path.insert(0, '/home/pi/yahboomcar_ws/src/dofbot_tracker/nodes')
 from dofbot_lib import ArmController
+from tracker_config import TrackerConfig
+from vision_lib import CameraManager, RegionSelector, VisionProcessor, DisplayManager, DetectionResult, ROI
+from tracker_controller import TrackingController, ServoCommand
 
 
 class StandaloneTracker:
     """
     Standalone color tracker with arm control (no ROS required).
 
-    This class demonstrates the same tracking algorithm as the ROS node
-    but runs independently for testing.
+    This class serves as the main orchestrator, wiring together the
+    component classes following the Dependency Inversion Principle.
+
+    State machine: IDLE → REGION_SELECTED → LEARNING → TRACKING
+
+    Usage:
+        config = TrackerConfig()
+        tracker = StandaloneTracker(config=config)
+        tracker.run()
     """
 
-    def __init__(self):
-        # Camera setup
-        self.cap = None
-        self.frame_width = 640
-        self.frame_height = 480
+    def __init__(self, config=None, camera=None, detector=None, controller=None):
+        """
+        Initialize the tracker with dependency injection.
+
+        Args:
+            config: TrackerConfig instance (creates default if None)
+            camera: CameraManager instance (creates default if None)
+            detector: VisionProcessor instance (creates default if None)
+            controller: TrackingController instance (creates default if None)
+        """
+        self.config = config or TrackerConfig()
+
+        # Create components with dependency injection
+        self.camera = camera or CameraManager(
+            width=self.config.frame_width,
+            height=self.config.frame_height
+        )
+
+        self.region_selector = RegionSelector()
+        self.vision_processor = detector or VisionProcessor(self.config)
+        self.display_manager = DisplayManager(
+            frame_width=self.config.frame_width,
+            frame_height=self.config.frame_height
+        )
+        self.controller = controller or TrackingController(self.config)
+
+        # Arm controllers
+        self.pan_arm = ArmController(servo_id=self.config.pan_servo_id)
+        # Tilt uses two servos: Servo 3 for downward tilt (start: 90°),
+        # Servo 4 for upward tilt (start: 5°)
+        self.tilt_down_arm = ArmController(servo_id=3)   # Mechanically reversed
+        self.tilt_up_arm = ArmController(servo_id=4)     # Mechanically reversed
 
         # Tracking state
         self.tracking = False
-        self.object_x = 0
-        self.object_y = 0
-        self.object_radius = 0
-
-        # Selection state
-        self.selecting = False
-        self.selection_start = (0, 0)
-        self.selection_end = (0, 0)
-        self.roi = None
-
-        # HSV range for color detection
-        self.hsv_range = None
-
-        # Arm controllers
-        self.pan_arm = ArmController(servo_id=1)
-        self.tilt_arm = ArmController(servo_id=2)
-
-        # Tracking parameters
-        self.deadzone = 20
-        self.pan_gain = 0.15  # Reduced from 0.5 for smoother control
-        self.tilt_gain = 0.15  # Reduced from 0.5 for smoother control
-
-        # Center of frame
-        self.center_x = self.frame_width / 2
-        self.center_y = self.frame_height / 2
-
-        # Rate limiting - don't update servos every frame
-        self.last_servo_update = 0
-        self.servo_update_interval = 0.2  # Update servos at most every 200ms
-
-        # Position smoothing
-        self.filtered_x = self.center_x
-        self.filtered_y = self.center_y
-
-        # Frame skipping for performance
         self.frame_count = 0
-        self.process_interval = 2  # Process every Nth frame
 
-        # FPS tracking
-        self.fps = 0
-        self.fps_update_time = time.time()
-        self.fps_frame_count = 0
+        # Setup window and mouse
+        cv.namedWindow("Color Tracker - Standalone")
+        cv.setMouseCallback("Color Tracker - Standalone", self._mouse_callback)
 
-        # Initialize camera
-        self.init_camera()
+    def _mouse_callback(self, event, x, y, flags, param):
+        """Internal mouse callback wrapper."""
+        self.region_selector.handle_event(event, x, y, flags, param)
 
-    def init_camera(self):
-        """Initialize camera with multiple fallback methods."""
-        methods = [
-            ("Camera index 0", 0, None),
-            ("Device path /dev/video0", "/dev/video0", None),
-        ]
+    def _learn_color(self, frame):
+        """Learn color from selected region."""
+        roi = self.region_selector.get_roi()
+        if roi is None:
+            print("[StandaloneTracker] No valid ROI selected")
+            return False
 
-        for name, device, backend in methods:
-            print(f"Trying: {name}...", end=" ")
-            try:
-                if backend is not None:
-                    cap = cv.VideoCapture(device, backend)
+        print("[StandaloneTracker] Learning color from selected region...")
+        self.vision_processor.learn_color_from_roi(frame, roi)
+        self.tracking = True
+        print("[StandaloneTracker] Tracking enabled!")
+        return True
+
+    def _stop_tracking(self):
+        """Stop tracking and reset arm."""
+        print("[StandaloneTracker] Disabling tracking...")
+        self.tracking = False
+        self.pan_arm.move_to_center()
+        # Return tilt servos to start positions with angle checks
+        current_down = self.tilt_down_arm.read_angle(3)
+        if current_down is None or abs(current_down - 90) > 10:
+            time.sleep((300 / 1000) * 1.2)
+            self.tilt_down_arm.write_angle(90, time_ms=300)
+        else:
+            print(f"  Tilt down: skipped (already at {current_down}°)")
+        current_up = self.tilt_up_arm.read_angle(4)
+        if current_up is None or abs(current_up - 5) > 10:
+            time.sleep((300 / 1000) * 1.2)
+            self.tilt_up_arm.write_angle(5, time_ms=300)
+        else:
+            print(f"  Tilt up: skipped (already at {current_up}°)")
+        time.sleep(0.3)
+
+    def _reset(self):
+        """Reset tracker state."""
+        print("[StandaloneTracker] Resetting...")
+        self.region_selector.reset()
+        self.vision_processor.reset()
+        self.controller.reset()
+        self.tracking = False
+        self.pan_arm.move_to_center()
+        # Return tilt servos to start positions with angle checks
+        current_down = self.tilt_down_arm.read_angle(3)
+        if current_down is None or abs(current_down - 90) > 10:
+            time.sleep((300 / 1000) * 1.2)
+            self.tilt_down_arm.write_angle(90, time_ms=300)
+        else:
+            print(f"  Tilt down: skipped (already at {current_down}°)")
+        current_up = self.tilt_up_arm.read_angle(4)
+        if current_up is None or abs(current_up - 5) > 10:
+            time.sleep((300 / 1000) * 1.2)
+            self.tilt_up_arm.write_angle(5, time_ms=300)
+        else:
+            print(f"  Tilt up: skipped (already at {current_up}°)")
+        time.sleep(0.3)
+
+    def _draw_pipeline(self, frames: dict) -> np.ndarray:
+        """
+        Combine pipeline frames into single visualization.
+
+        Layout:
+        +------------------+------------------+
+        |   ORIGINAL       |     MASK         |
+        +------------------+------------------+
+        |   FILTERED       |    DETECTED      |
+        +------------------+------------------+
+        """
+        h, w = self.config.frame_height, self.config.frame_width
+
+        # Create empty frames if missing
+        original = frames.get('original')
+        mask = frames.get('mask', np.zeros((h, w, 3), dtype=np.uint8))
+        filtered = frames.get('filtered', np.zeros((h, w, 3), dtype=np.uint8))
+        detected = frames.get('detected', np.zeros((h, w, 3), dtype=np.uint8))
+
+        if original is None:
+            original = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Draw selection rectangle on original
+        selection = self.region_selector.get_current_selection()
+        if selection:
+            x1, y1, x2, y2 = selection
+            cv.rectangle(original, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # Draw detection info
+        if hasattr(self, 'last_detection') and self.last_detection:
+            info_text = f"Found: {self.last_detection.found}"
+            cv.putText(original, info_text, (10, h - 80),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            if self.last_detection.found:
+                cv.putText(original, f"Pos: ({self.last_detection.x}, {self.last_detection.y})",
+                          (10, h - 100), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv.putText(original, f"Radius: {self.last_detection.radius}px",
+                          (10, h - 120), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Build 2x2 grid
+        top_row = np.hstack([original, mask])
+        bottom_row = np.hstack([filtered, detected])
+        combined = np.vstack([top_row, bottom_row])
+
+        return combined
+
+    def _process_frame(self, frame):
+        """
+        Process a single frame during tracking.
+
+        Args:
+            frame: Input BGR frame from camera
+
+        Returns:
+            Dictionary with pipeline frames: 'original', 'mask', 'filtered', 'detected'
+        """
+        # Detect object
+        result = self.vision_processor.detect(frame)
+        self.last_detection = result
+
+        # Build pipeline visualization
+        frames = {'original': frame.copy()}
+
+        if result.found:
+            # Update controller with detected position
+            command = self.controller.update(result.x, result.y)
+
+            if command.should_update:
+                # Execute servo movement with dual-servo tilt logic
+                print(f"[TestTracker] Writing pan={command.pan_angle}°, tilt_down={command.tilt_down_angle}°, tilt_up={command.tilt_up_angle}°")
+                # Pan servo with angle check
+                current_pan = self.pan_arm.read_angle(self.config.pan_servo_id)
+                if current_pan is None or abs(current_pan - command.pan_angle) > 10:
+                    time.sleep((command.move_time_ms / 1000) * 1.2)
+                    self.pan_arm.write_angle(command.pan_angle, time_ms=command.move_time_ms)
                 else:
-                    cap = cv.VideoCapture(device)
-
-                if cap.isOpened():
-                    cap.set(cv.CAP_PROP_FRAME_WIDTH, self.frame_width)
-                    cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-                    self.cap = cap
-                    print("Success!")
-                    break
+                    print(f"  Pan: skipped (already at {current_pan}°)")
+                # Tilt down servo with angle check
+                current_down = self.tilt_down_arm.read_angle(3)
+                if current_down is None or abs(current_down - command.tilt_down_angle) > 10:
+                    time.sleep((command.move_time_ms / 1000) * 1.2)
+                    self.tilt_down_arm.write_angle(command.tilt_down_angle, time_ms=command.move_time_ms)
                 else:
-                    print("Failed")
-                    cap.release()
-            except Exception as e:
-                print(f"Error: {e}")
+                    print(f"  Tilt down: skipped (already at {current_down}°)")
+                # Tilt up servo with angle check
+                current_up = self.tilt_up_arm.read_angle(4)
+                if current_up is None or abs(current_up - command.tilt_up_angle) > 10:
+                    time.sleep((command.move_time_ms / 1000) * 1.2)
+                    self.tilt_up_arm.write_angle(command.tilt_up_angle, time_ms=command.move_time_ms)
+                else:
+                    print(f"  Tilt up: skipped (already at {current_up}°)")
 
-        if self.cap is None or not self.cap.isOpened():
-            print("\nERROR: Cannot open camera!")
-            print("Check that camera is not being used by another process.")
-            print("Try: sudo pkill -f YahboomArm")
-            sys.exit(1)
+            # Get HSV range for mask
+            if self.vision_processor.hsv_range:
+                lower = np.array(self.vision_processor.hsv_range[0], dtype="uint8")
+                upper = np.array(self.vision_processor.hsv_range[1], dtype="uint8")
 
-    def mouse_callback(self, event, x, y, flags, param):
-        """Handle mouse events for region selection."""
-        if event == cv.EVENT_LBUTTONDOWN:
-            self.selecting = True
-            self.selection_start = (x, y)
-            self.selection_end = (x, y)
+                # Create mask
+                hsv_image = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+                mask = cv.inRange(hsv_image, lower, upper)
 
-        elif event == cv.EVENT_MOUSEMOVE:
-            if self.selecting:
-                self.selection_end = (x, y)
+                # Apply morphological closing
+                kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5))
+                filtered = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
 
-        elif event == cv.EVENT_LBUTTONUP:
-            self.selecting = False
-            self.selection_end = (x, y)
+                # Convert to 3-channel for display
+                mask_rgb = cv.cvtColor(mask, cv.COLOR_GRAY2BGR)
+                filtered_rgb = cv.cvtColor(filtered, cv.COLOR_GRAY2BGR)
 
-            # Calculate ROI
-            x1 = min(self.selection_start[0], self.selection_end[0])
-            y1 = min(self.selection_start[1], self.selection_end[1])
-            x2 = max(self.selection_start[0], self.selection_end[0])
-            y2 = max(self.selection_start[1], self.selection_end[1])
+                frames['mask'] = mask_rgb
+                frames['filtered'] = filtered_rgb
 
-            if x2 - x1 > 10 and y2 - y1 > 10:
-                self.roi = (x1, y1, x2, y2)
-                print(f"Region selected: {self.roi}")
-                print("Press SPACE to learn color and start tracking")
+                # Draw detection on detected frame
+                detected = frame.copy()
+                cv.circle(detected, (result.x, result.y), result.radius, (255, 0, 255), 2)
+                cv.circle(detected, (result.x, result.y), 3, (0, 0, 255), -1)
 
-    def learn_color_from_roi(self, image):
-        """Learn HSV color range from selected region."""
-        if self.roi is None:
-            return None
+                # Draw center crosshair
+                center_x = self.config.frame_width // 2
+                center_y = self.config.frame_height // 2
+                cv.line(detected, (center_x, 0), (center_x, self.config.frame_height), (255, 255, 0), 1)
+                cv.line(detected, (0, center_y), (self.config.frame_width, center_y), (255, 255, 0), 1)
 
-        x1, y1, x2, y2 = self.roi
+                frames['detected'] = detected
 
-        # Convert to HSV
-        hsv_image = cv.cvtColor(image, cv.COLOR_BGR2HSV)
-
-        # Extract ROI using NumPy slicing (much faster than loops)
-        roi_hsv = hsv_image[y1:y2, x1:x2]
-
-        # Extract each channel and calculate min/max using vectorized operations
-        H_values = roi_hsv[:, :, 0]
-        S_values = roi_hsv[:, :, 1]
-        V_values = roi_hsv[:, :, 2]
-
-        # Calculate range with tolerance
-        H_min = max(0, int(np.min(H_values)) - 5)
-        H_max = min(255, int(np.max(H_values)) + 5)
-        S_min = max(0, int(np.min(S_values)) - 20)
-        S_max = 253
-        V_min = max(0, int(np.min(V_values)) - 20)
-        V_max = 255
-
-        self.hsv_range = (
-            (int(H_min), int(S_min), int(V_min)),
-            (int(H_max), int(S_max), int(V_max))
-        )
-
-        print(f"Learned HSV range:")
-        print(f"  Lower: H={H_min:.0f}, S={S_min:.0f}, V={V_min:.0f}")
-        print(f"  Upper: H={H_max:.0f}, S={S_max:.0f}, V={V_max:.0f}")
-        print("Tracking ready! Press SPACE to enable tracking.")
-        return self.hsv_range
-
-    def detect_object(self, image, hsv_range):
-        """Detect colored object in image."""
-        if hsv_range is None:
-            return image, False
-
-        # Convert to HSV
-        hsv_image = cv.cvtColor(image, cv.COLOR_BGR2HSV)
-
-        # Create mask
-        lower = np.array(hsv_range[0], dtype="uint8")
-        upper = np.array(hsv_range[1], dtype="uint8")
-        mask = cv.inRange(hsv_image, lower, upper)
-
-        # Morphological operations
-        kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5))
-        mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
-
-        # Threshold
-        _, binary = cv.threshold(mask, 10, 255, cv.THRESH_BINARY)
-
-        # Find contours
-        contours, _ = cv.findContours(binary, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-
-        if len(contours) > 0:
-            # Find largest contour
-            areas = [cv.contourArea(c) for c in contours]
-            max_index = areas.index(max(areas))
-            largest = contours[max_index]
-
-            # Get bounding circle
-            (cx, cy), radius = cv.minEnclosingCircle(largest)
-            self.object_x = int(cx)
-            self.object_y = int(cy)
-            self.object_radius = int(radius)
-
-            # Draw on image
-            cv.circle(image, (self.object_x, self.object_y), self.object_radius, (255, 0, 255), 2)
-            cv.circle(image, (self.object_x, self.object_y), 3, (0, 0, 255), -1)
-
-            return image, True
-
-        self.object_x = 0
-        self.object_y = 0
-        self.object_radius = 0
-        return image, False
-
-    def update_fps(self):
-        """Calculate and update FPS counter."""
-        self.fps_frame_count += 1
-        current_time = time.time()
-        elapsed = current_time - self.fps_update_time
-
-        # Update FPS every second
-        if elapsed >= 1.0:
-            self.fps = self.fps_frame_count / elapsed
-            self.fps_frame_count = 0
-            self.fps_update_time = current_time
-
-    def control_arm(self):
-        """Control arm servos based on object position."""
-        if not self.tracking or self.object_x == 0:
-            return
-
-        # Rate limiting - don't update too frequently
-        current_time = time.time()
-        if current_time - self.last_servo_update < self.servo_update_interval:
-            return
-        self.last_servo_update = current_time
-
-        # Position smoothing using exponential moving average (EMA)
-        # Filters out noisy pixel-to-pixel jumps in color detection
-        alpha = 0.5  # Balance: 0.3=smooth/slow, 0.7=responsive/jittery
-        self.filtered_x = alpha * self.object_x + (1 - alpha) * self.filtered_x
-        self.filtered_y = alpha * self.object_y + (1 - alpha) * self.filtered_y
-
-        # Calculate error from center
-        x_error = self.filtered_x - self.center_x
-        y_error = self.filtered_y - self.center_y
-
-        # Deadzone check
-        if abs(x_error) < self.deadzone and abs(y_error) < self.deadzone:
-            return
-
-        # Calculate target angles
-        pan_offset = x_error * self.pan_gain
-        tilt_offset = y_error * self.tilt_gain
-
-        pan_angle = 90 - pan_offset
-        tilt_angle = 90 + tilt_offset  # Invert Y
-
-        # Clamp to valid ranges
-        pan_angle = max(0, min(180, pan_angle))
-        tilt_angle = max(0, min(180, tilt_angle))
-
-        # Send to servos with slower movement time
-        self.pan_arm.write_angle(int(pan_angle), time_ms=400)
-        self.tilt_arm.write_angle(int(tilt_angle), time_ms=400)
+        return frames
 
     def run(self):
         """Main loop."""
@@ -291,121 +282,109 @@ class StandaloneTracker:
         print("  'r':   Reset selection")
         print("  'q':   Quit\n")
 
-        # Setup window and mouse
-        cv.namedWindow("Color Tracker - Standalone")
-        cv.setMouseCallback("Color Tracker - Standalone", self.mouse_callback)
-
-        # Reset arm to center
-        print("Moving arm to center position...")
-        self.pan_arm.move_to_center()
-        self.tilt_arm.move_to_center()
+        # Reset arm to start positions with angle checks
+        print("[StandaloneTracker] Moving arm to start position...")
+        current_pan = self.pan_arm.read_angle(self.config.pan_servo_id)
+        if current_pan is None or abs(current_pan - 90) > 10:
+            time.sleep((500 / 1000) * 1.2)
+            self.pan_arm.write_angle(90, time_ms=500)
+        else:
+            print(f"  Pan: skipped (already at {current_pan}°)")
+        current_down = self.tilt_down_arm.read_angle(3)
+        if current_down is None or abs(current_down - 90) > 10:
+            time.sleep((500 / 1000) * 1.2)
+            self.tilt_down_arm.write_angle(90, time_ms=500)
+        else:
+            print(f"  Tilt down: skipped (already at {current_down}°)")
+        current_up = self.tilt_up_arm.read_angle(4)
+        if current_up is None or abs(current_up - 5) > 10:
+            time.sleep((500 / 1000) * 1.2)
+            self.tilt_up_arm.write_angle(5, time_ms=500)
+        else:
+            print(f"  Tilt up: skipped (already at {current_up}°)")
         time.sleep(0.5)
 
-        print("\nStarting main loop...\n")
+        print("\n[StandaloneTracker] Starting main loop...\n")
 
         while True:
-            ret, frame = self.cap.read()
+            ret, frame = self.camera.read()
             if not ret:
-                print("Error reading frame!")
+                print("[StandaloneTracker] Error reading frame!")
                 break
 
             # Update FPS counter
-            self.update_fps()
+            self.display_manager.update_fps()
             self.frame_count += 1
 
             # Determine if we should process this frame
-            should_process = (self.frame_count % self.process_interval == 0)
+            should_process = (self.frame_count % self.config.process_interval == 0)
 
-            # Only copy frame if we need to draw on it (avoid unnecessary copy)
-            display = frame
-
-            # Draw selection rectangle
-            if self.selecting or self.roi is not None:
-                if self.selecting:
-                    x1, y1 = self.selection_start
-                    x2, y2 = self.selection_end
-                else:
-                    x1, y1, x2, y2 = self.roi
-
-                cv.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            # Display mode
+            # Display mode and process frame
             if self.tracking and should_process:
-                cv.putText(display, "TRACKING ACTIVE", (10, 30),
+                frames = self._process_frame(frame)
+                combined = self._draw_pipeline(frames)
+
+                # Add FPS overlay on pipeline
+                cv.putText(combined, f"FPS: {self.display_manager.fps:.1f}", (10, 30),
                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                # Detect and track
-                display, found = self.detect_object(frame, self.hsv_range)
-                if found:
-                    self.control_arm()
-
-                    # Draw center crosshair
-                    center_x = self.frame_width // 2
-                    center_y = self.frame_height // 2
-                    cv.line(display, (center_x, 0), (center_x, self.frame_height), (255, 255, 0), 1)
-                    cv.line(display, (0, center_y), (self.frame_width, center_y), (255, 255, 0), 1)
-
-                    # Draw error indicators
-                    cv.arrowedLine(display, (center_x, center_y), (self.object_x, self.object_y),
-                                  (0, 255, 255), 2)
-
-            elif self.tracking and not should_process:
-                # Skipped frame - still show tracking status
-                cv.putText(display, "TRACKING ACTIVE", (10, 30),
+                # Add status overlay
+                status_y = combined.shape[0] - 60
+                cv.putText(combined, "DETECTION ACTIVE", (10, status_y),
                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                status_y += 30
+                if self.vision_processor.hsv_range:
+                    cv.putText(combined, f"HSV: ({self.vision_processor.hsv_range[0]}) - ({self.vision_processor.hsv_range[1]})",
+                              (10, status_y), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                display_frame = combined
             else:
-                cv.putText(display, "SELECT REGION - Press SPACE to track", (10, 30),
-                          cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                # Show original frame with status
+                selection = self.region_selector.get_current_selection()
+                self.display_manager.render_selection(frame, selection)
+                self.display_manager.render_status(frame, self.tracking, self.region_selector.get_roi() is not None)
+                display_frame = frame
 
-            # Show FPS and instructions
-            cv.putText(display, f"FPS: {self.fps:.1f}", (10, self.frame_height - 30),
-                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv.putText(display, "Press SPACE to track, 'r' to reset, 'q' to quit",
-                      (10, self.frame_height - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-            cv.imshow("Color Tracker - Standalone", display)
+            cv.imshow("Color Tracker - Standalone", display_frame)
 
             # Handle keys
             key = cv.waitKey(1) & 0xFF
 
             if key == ord('q') or key == 27:
-                print("\nQuitting...")
+                print("\n[StandaloneTracker] Quitting...")
                 break
 
             elif key == ord(' '):  # SPACE
-                if self.roi is not None:
-                    if not self.tracking:
-                        print("\nLearning color from selected region...")
-                        self.hsv_range = self.learn_color_from_roi(frame)
-                        if self.hsv_range is not None:
-                            self.tracking = True
-                            print("Tracking enabled!")
+                if not self.tracking:
+                    if self.region_selector.get_roi() is not None:
+                        if not self._learn_color(frame):
+                            continue
                     else:
-                        print("\nDisabling tracking...")
-                        self.tracking = False
-                        self.pan_arm.move_to_center()
-                        self.tilt_arm.move_to_center()
-                        time.sleep(0.3)
+                        print("[StandaloneTracker] Please select a region first!")
                 else:
-                    print("Please select a region first!")
+                    self._stop_tracking()
 
             elif key == ord('r') or key == ord('R'):
-                print("\nResetting...")
-                self.roi = None
-                self.hsv_range = None
-                self.tracking = False
-                self.object_x = 0
-                self.object_y = 0
-                self.pan_arm.move_to_center()
-                self.tilt_arm.move_to_center()
-                time.sleep(0.3)
+                self._reset()
 
         # Cleanup
-        self.cap.release()
+        self.camera.release()
         cv.destroyAllWindows()
         self.pan_arm.move_to_center()
-        self.tilt_arm.move_to_center()
-        print("Done!")
+        # Return tilt servos to start positions with angle checks
+        current_down = self.tilt_down_arm.read_angle(3)
+        if current_down is None or abs(current_down - 90) > 10:
+            time.sleep((300 / 1000) * 1.2)
+            self.tilt_down_arm.write_angle(90, time_ms=300)
+        else:
+            print(f"  Tilt down: skipped (already at {current_down}°)")
+        current_up = self.tilt_up_arm.read_angle(4)
+        if current_up is None or abs(current_up - 5) > 10:
+            time.sleep((300 / 1000) * 1.2)
+            self.tilt_up_arm.write_angle(5, time_ms=300)
+        else:
+            print(f"  Tilt up: skipped (already at {current_up}°)")
+        print("[StandaloneTracker] Done!")
 
 
 if __name__ == '__main__':

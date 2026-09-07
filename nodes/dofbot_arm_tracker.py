@@ -11,12 +11,14 @@ ROS Subscription:
 
 ROS Parameters:
     - ~pan_servo_id (int): Servo ID for pan movement (default: 1)
-    - ~tilt_servo_id (int): Servo ID for tilt movement (default: 2)
     - ~tracking_deadzone (int): Deadzone for object position (default: 20)
     - ~max_pan_angle (float): Maximum pan angle in degrees (default: 180)
     - ~max_tilt_angle (float): Maximum tilt angle in degrees (default: 180)
-    - ~pan_gain (float): Proportional gain for pan control (default: 0.5)
-    - ~tilt_gain (float): Proportional gain for tilt control (default: 0.5)
+    - ~pan_gain (float): Proportional gain for pan control (default: 0.18)
+    - ~tilt_gain (float): Proportional gain for tilt control (default: 0.18)
+
+Note: Tilt uses two servos - Servo 3 (start: 90°) for downward tilt and
+Servo 4 (start: 5°) for upward tilt. Both are mechanically reversed.
 
 Usage:
     rosrun dofbot_tracker dofbot_arm_tracker.py
@@ -158,12 +160,12 @@ class DofbotArmTracker:
 
         # Get parameters
         self.pan_servo_id = rospy.get_param('~pan_servo_id', 1)
-        self.tilt_servo_id = rospy.get_param('~tilt_servo_id', 2)
+        self.tilt_servo_id = rospy.get_param('~tilt_servo_id', 3)  # Changed from 2 to 3
         self.deadzone = rospy.get_param('~tracking_deadzone', 20)
         self.max_pan_angle = rospy.get_param('~max_pan_angle', 180)
         self.max_tilt_angle = rospy.get_param('~max_tilt_angle', 180)
-        self.pan_gain = rospy.get_param('~pan_gain', 0.5)
-        self.tilt_gain = rospy.get_param('~tilt_gain', 0.5)
+        self.pan_gain = rospy.get_param('~pan_gain', 0.18)  # Changed from 0.5 for stability
+        self.tilt_gain = rospy.get_param('~tilt_gain', 0.18)  # Changed from 0.5 for stability
 
         # Image dimensions (matching color tracker)
         self.image_width = 640
@@ -173,7 +175,9 @@ class DofbotArmTracker:
 
         # Initialize servos
         self.pan_controller = ArmController(self.pan_servo_id)
-        self.tilt_controller = ArmController(self.tilt_servo_id)
+        # Tilt uses two servos: Servo 3 for downward tilt, Servo 4 for upward tilt
+        self.tilt_down_controller = ArmController(3)  # Servo 3 (mechanically reversed)
+        self.tilt_up_controller = ArmController(4)    # Servo 4 (mechanically reversed)
 
         # Current object position
         self.object_x = 0
@@ -191,7 +195,8 @@ class DofbotArmTracker:
         # Logging configuration
         rospy.loginfo("Dofbot Arm Tracker Configuration:")
         rospy.loginfo(f"  Pan Servo ID: {self.pan_servo_id}")
-        rospy.loginfo(f"  Tilt Servo ID: {self.tilt_servo_id}")
+        rospy.loginfo(f"  Tilt Down Servo: 3 (90° start)")
+        rospy.loginfo(f"  Tilt Up Servo: 4 (5° start)")
         rospy.loginfo(f"  Deadzone: {self.deadzone} pixels")
         rospy.loginfo(f"  Pan Gain: {self.pan_gain}")
         rospy.loginfo(f"  Tilt Gain: {self.tilt_gain}")
@@ -214,10 +219,12 @@ class DofbotArmTracker:
         # Cleanup handler
         rospy.on_shutdown(self.shutdown_handler)
 
-        # Initialize servos to center
+        # Initialize servos to starting positions:
+        # Pan (Servo 1): 90°, Tilt Down (Servo 3): 90°, Tilt Up (Servo 4): 5°
         rospy.sleep(0.5)
-        self.pan_controller.move_to_center()
-        self.tilt_controller.move_to_center()
+        self.pan_controller.write_angle(90, time=500)
+        self.tilt_down_controller.write_angle(90, time=500)
+        self.tilt_up_controller.write_angle(5, time=500)
         rospy.sleep(0.5)
 
         rospy.loginfo("Dofbot Arm Tracker initialized successfully!")
@@ -287,36 +294,63 @@ class DofbotArmTracker:
         if abs(x_error) < self.deadzone and abs(y_error) < self.deadzone:
             return
 
-        # Calculate target angles using proportional control
-        # The gain determines how aggressively the arm tracks
+        # Apply exponential moving average (EMA) smoothing to Y position
+        # This reduces jittery movements in tilt tracking
+        if not hasattr(self, 'filtered_y'):
+            self.filtered_y = self.center_y
+        self.filtered_y = self.tilt_gain * self.object_y + (1 - self.tilt_gain) * self.filtered_y
+
+        # Calculate filtered Y error from center
+        y_error_filtered = self.filtered_y - self.center_y
+
+        # Tilt control logic using two servos:
+        # - Servo 3 (tilt_down): 90° start, moves to 40° for downward tilt
+        # - Servo 4 (tilt_up): 5° start, moves to 60° for upward tilt
+        # Both servos are mechanically reversed
+
+        if y_error_filtered > self.deadzone:
+            # Object is below center - move arm UP (tilt down with Servo 3)
+            # y_error is positive when object is below center
+            # To move arm UP, we need to reduce Servo 3 angle (mechanically reversed)
+            tilt_down_angle = 90 - (y_error_filtered * self.pan_gain)  # Use pan_gain for tilt too
+            tilt_down_angle = max(40, min(90, tilt_down_angle))  # Clamp: 40-90°
+            self.tilt_down_controller.write_angle(int(tilt_down_angle), time=100)
+            self.tilt_up_controller.write_angle(5, time=100)  # Reset Servo 4
+            rospy.logdebug(f"Tilt UP: Y_err={y_error_filtered:+.1f} -> Servo3={tilt_down_angle:.1f}°")
+        elif y_error_filtered < -self.deadzone:
+            # Object is above center - move arm DOWN (tilt up with Servo 4)
+            # y_error is negative when object is above center
+            # To move arm DOWN, we need to increase Servo 4 angle (mechanically reversed)
+            tilt_up_angle = 5 - (y_error_filtered * self.pan_gain)  # Negative * Negative = positive
+            tilt_up_angle = max(5, min(60, tilt_up_angle))  # Clamp: 5-60°
+            self.tilt_up_controller.write_angle(int(tilt_up_angle), time=100)
+            self.tilt_down_controller.write_angle(90, time=100)  # Reset Servo 3
+            rospy.logdebug(f"Tilt DOWN: Y_err={y_error_filtered:+.1f} -> Servo4={tilt_up_angle:.1f}°")
+        else:
+            # In deadzone - return both servos to start positions
+            self.tilt_down_controller.write_angle(90, time=100)
+            self.tilt_up_controller.write_angle(5, time=100)
+            rospy.logdebug("Tilt: In deadzone - returning to start")
+
+        # Update pan servo (unchanged)
         pan_offset = x_error * self.pan_gain
-        tilt_offset = y_error * self.tilt_gain
-
-        # Calculate new angles (current angle + offset)
-        # Note: Y is inverted in image coordinates (top=0, bottom=height)
-        # so we invert the tilt calculation
         pan_angle = 90 + pan_offset
-        tilt_angle = 90 - tilt_offset  # Invert Y for natural movement
-
-        # Clamp to valid ranges
         pan_angle = max(0, min(self.max_pan_angle, pan_angle))
-        tilt_angle = max(0, min(self.max_tilt_angle, tilt_angle))
-
-        # Send commands to servos
         self.pan_controller.write_angle(int(pan_angle), time=100)
-        self.tilt_controller.write_angle(int(tilt_angle), time=100)
 
         # Log occasionally
         if rospy.get_time() - self.last_update_time > 1.0:
-            rospy.logdebug(f"Tracking: X_err={x_error:+.1f}, Y_err={y_error:+.1f} -> "
-                          f"Pan={pan_angle:.1f}°, Tilt={tilt_angle:.1f}°")
+            rospy.logdebug(f"Tracking: X_err={x_error:+.1f}, Y_err={y_error_filtered:+.1f} -> "
+                          f"Pan={pan_angle:.1f}°")
             self.last_update_time = rospy.get_time()
 
     def shutdown_handler(self):
         """ROS shutdown handler - clean up servos."""
         rospy.loginfo("Shutting down Dofbot Arm Tracker...")
         self.pan_controller.move_to_center()
-        self.tilt_controller.move_to_center()
+        # Return tilt servos to start positions
+        self.tilt_down_controller.write_angle(90, time=300)
+        self.tilt_up_controller.write_angle(5, time=300)
         rospy.sleep(0.2)
         rospy.loginfo("ArmTracker shutdown complete.")
 

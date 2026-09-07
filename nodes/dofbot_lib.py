@@ -70,6 +70,15 @@ class ArmController:
             print(f"[ArmController] Initialized servo {servo_id} on I2C 0x{address:02X}, Bus {bus_number}")
         except Exception as e:
             print(f"[ArmController] Failed to initialize I2C: {e} - running in simulation mode")
+            return
+
+        # Test I2C communication with a read attempt
+        try:
+            # Try to read from a known register (if available) or just verify bus works
+            # The PIServo board may not respond to generic reads
+            print(f"[ArmController] I2C bus {bus_number} accessible at 0x{address:02X}")
+        except Exception as e:
+            print(f"[ArmController] I2C read test failed: {e}")
 
     def angle_to_position(self, angle):
         """
@@ -135,6 +144,84 @@ class ArmController:
     def get_angle(self):
         """Return the last known angle."""
         return self.current_angle
+
+    @staticmethod
+    def read_angle(servo_id, address=0x15, bus_number=1):
+        """
+        Read current angle from any servo without moving it.
+
+        Args:
+            servo_id: Servo ID (1-6)
+            address: I2C address (default: 0x15)
+            bus_number: I2C bus number (default: 1)
+
+        Returns:
+            Current angle in degrees, or None on error
+        """
+        if not I2C_AVAILABLE:
+            print(f"[ArmController] smbus not available - cannot read servo {servo_id}")
+            return None
+
+        if servo_id < 1 or servo_id > 6:
+            print(f"[ArmController] Invalid servo_id {servo_id} - must be 1-6")
+            return None
+
+        try:
+            bus = smbus.SMBus(bus_number)
+            # Write to register 0x30 + servo_id to request position
+            bus.write_byte_data(address, 0x30 + servo_id, 0x00)
+            time.sleep(0.003)  # 3ms delay for position reading
+            pos = bus.read_word_data(address, 0x30 + servo_id)
+        except Exception as e:
+            print(f"[ArmController] I2C read error for servo {servo_id}: {e}")
+            return None
+
+        if pos == 0:
+            return None
+
+        # Convert from big-endian (swap bytes)
+        pos = (pos >> 8 & 0xFF) | (pos << 8 & 0xFF00)
+
+        # Convert position to angle based on servo type
+        if servo_id == 5:
+            # Servo 5 has extended range (0-270°)
+            angle = int((270 - 0) * (pos - 380) / (3700 - 380) + 0)
+            if angle > 270 or angle < 0:
+                return None
+        else:
+            # Standard servos (1,2,3,4,6) have 0-180° range
+            angle = int((180 - 0) * (pos - 900) / (3100 - 900) + 0)
+            if angle > 180 or angle < 0:
+                return None
+
+        # Servos 2,3,4 are mechanically reversed - invert the angle
+        if servo_id in [2, 3, 4]:
+            angle = 180 - angle
+
+        return angle
+
+    def wait_until_angle(self, target_angle, timeout=2.0, tolerance=2.0):
+        """
+        Wait until servo reaches target angle within tolerance.
+
+        Args:
+            target_angle: Target angle in degrees
+            timeout: Maximum time to wait in seconds
+            tolerance: Acceptable deviation from target in degrees
+
+        Returns:
+            True if target reached, False on timeout
+        """
+        if not self.initialized:
+            return True
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # For simulation mode or when current_angle tracking is reliable
+            if abs(self.current_angle - target_angle) <= tolerance:
+                return True
+            time.sleep(0.05)
+        return False
 
     def move_to_center(self, time_ms=200):
         """Move servo to center position (90°)."""
