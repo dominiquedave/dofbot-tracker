@@ -18,9 +18,10 @@ import cv2 as cv
 import numpy as np
 import time
 import sys
+import os
 
 # Import the components
-sys.path.insert(0, '/home/pi/yahboomcar_ws/src/dofbot_tracker/nodes')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dofbot_lib import ArmController
 from tracker_config import TrackerConfig
 from vision_lib import CameraManager, RegionSelector, VisionProcessor, DisplayManager, DetectionResult, ROI

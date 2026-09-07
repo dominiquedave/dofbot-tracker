@@ -24,7 +24,7 @@ import os
 from typing import Tuple, Optional
 
 # Import the components
-sys.path.insert(0, '/home/pi/yahboomcar_ws/src/dofbot_tracker/nodes')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tracker_config import TrackerConfig
 from vision_lib import CameraManager, RegionSelector, VisionProcessor, DisplayManager, DetectionResult, ROI
 
@@ -223,7 +223,7 @@ class VisionProcessorTestHarness:
         cv.setMouseCallback("Vision Processor Test", self._mouse_callback)
 
         # HSV settings save path
-        self.hsv_save_path = "/home/pi/yahboomcar_ws/src/dofbot_tracker/nodes/hsv_settings.json"
+        self.hsv_save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hsv_settings.json")
 
     def _mouse_callback(self, event, x, y, flags, param):
         """Internal mouse callback wrapper."""

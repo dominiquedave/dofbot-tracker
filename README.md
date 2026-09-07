@@ -28,16 +28,45 @@ This package provides a ROS node that:
 
 ## Installation
 
+This package runs **standalone on the Raspberry Pi host** (Python 3.11, OpenCV
+4.8.1, `smbus`). ROS is *not* required for the tracker or any test harness —
+the `package.xml` / `CMakeLists.txt` / `launch/` scaffolding exists only for the
+optional ROS1 node (`dofbot_arm_tracker.py`), which must run inside the Yahboom
+`ros-melodic:dofbot` container.
+
 ```bash
-# Clone or copy this package to your catkin workspace
-cp -r ~/projects/dofbot_tracker /home/pi/yahboomcar_ws/src/
+git clone git@github.com:dominiquedave/dofbot-tracker.git ~/robot/dofbot-tracker
+cd ~/robot/dofbot-tracker/nodes
+python3 test_standalone_tracker.py
+```
 
-# Build the workspace
-cd /home/pi/yahboomcar_ws
-catkin_make
+Scripts resolve their own imports relative to `__file__`, so the repo can live
+anywhere.
 
-# Source the workspace
-source devel/setup.bash
+### Hardware preflight
+
+The servo board is at I2C `0x15` on bus 1 (the OLED is at `0x3c`):
+
+```bash
+sudo i2cdetect -y 1          # expect 15 and 3c
+python3 nodes/test_read_angle.py   # read all six servo angles, no movement
+```
+
+**Important:** the `ros-melodic:dofbot` container runs `YahboomArm.pyc`, which
+also drives `0x15`. I2C will not report a conflict — the two writers simply
+interleave and the arm fights itself. Stop the container before running host
+code that commands servos:
+
+```bash
+docker stop ecstatic_goodall
+```
+
+### Optional: ROS1 mode
+
+```bash
+# inside the ros-melodic:dofbot container
+cd /root/catkin_ws && catkin_make && source devel/setup.bash
+roslaunch dofbot_tracker arm_tracker.launch
 ```
 
 ## Usage
@@ -67,7 +96,7 @@ rosrun dofbot_tracker dofbot_arm_tracker.py
 Test the arm controller without ROS:
 ```bash
 # Move servo 1 (pan) to 90 degrees
-python3 /home/pi/yahboomcar_ws/src/dofbot_tracker/nodes/dofbot_lib.py --servo 1 --angle 90
+python3 ~/robot/dofbot-tracker/nodes/dofbot_lib.py --servo 1 --angle 90
 
 # Run a sequence of angles
 python3 dofbot_lib.py --servo 1 --sequence 0 45 90 135 180

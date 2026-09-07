@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Test script to read current angle from all servos."""
 import sys
-sys.path.insert(0, '/home/pi/yahboomcar_ws/src/dofbot_tracker/nodes')
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dofbot_lib import ArmController
 
 print('Testing read_angle() for each servo:')
