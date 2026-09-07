@@ -45,6 +45,19 @@ class ArmController:
     SERVO5_MIN = 380  # 0 degrees (extended range)
     SERVO5_MAX = 3700 # 270 degrees (extended range)
 
+    # Position readback timing.
+    # The board needs time to latch a position sample after the request byte.
+    # Measured on hardware: at 3ms ~50% of reads return 0; at 30ms, 0 failures
+    # over repeated sampling. 3ms was the original value and was the cause of
+    # intermittent None returns from read_angle().
+    READ_SETTLE_S = 0.03
+    READ_RETRIES = 3
+
+    # How far past a calibrated endpoint a reading may sit and still be
+    # treated as real. Servo 6 (gripper) parks at raw 3142 vs SERVO_MAX
+    # 3100, i.e. ~3.4 deg past 180.
+    RANGE_TOLERANCE_DEG = 5
+
     def __init__(self, servo_id, address=0x15, bus_number=1):
         """
         Initialize the arm controller.
@@ -166,33 +179,52 @@ class ArmController:
             print(f"[ArmController] Invalid servo_id {servo_id} - must be 1-6")
             return None
 
-        try:
-            bus = smbus.SMBus(bus_number)
-            # Write to register 0x30 + servo_id to request position
-            bus.write_byte_data(address, 0x30 + servo_id, 0x00)
-            time.sleep(0.003)  # 3ms delay for position reading
-            pos = bus.read_word_data(address, 0x30 + servo_id)
-        except Exception as e:
-            print(f"[ArmController] I2C read error for servo {servo_id}: {e}")
-            return None
-
-        if pos == 0:
+        # Request a position sample, then read it back. A read issued too soon
+        # returns 0 because the board has not latched the sample yet, so retry
+        # rather than reporting a zero as a failure.
+        pos = 0
+        for attempt in range(ArmController.READ_RETRIES):
+            try:
+                bus = smbus.SMBus(bus_number)
+                # Write to register 0x30 + servo_id to request position
+                bus.write_byte_data(address, 0x30 + servo_id, 0x00)
+                time.sleep(ArmController.READ_SETTLE_S)
+                pos = bus.read_word_data(address, 0x30 + servo_id)
+            except Exception as e:
+                print(f"[ArmController] I2C read error for servo {servo_id}: {e}")
+                return None
+            if pos != 0:
+                break
+        else:
+            print(f"[ArmController] servo {servo_id} returned 0 on "
+                  f"{ArmController.READ_RETRIES} attempts - no position latched")
             return None
 
         # Convert from big-endian (swap bytes)
         pos = (pos >> 8 & 0xFF) | (pos << 8 & 0xFF00)
 
-        # Convert position to angle based on servo type
+        # Map the raw position onto the servo's calibrated span.
         if servo_id == 5:
-            # Servo 5 has extended range (0-270°)
-            angle = int((270 - 0) * (pos - 380) / (3700 - 380) + 0)
-            if angle > 270 or angle < 0:
-                return None
+            # Servo 5 has extended range (0-270 degrees)
+            span_min, span_max, span_deg = (
+                ArmController.SERVO5_MIN, ArmController.SERVO5_MAX, 270)
         else:
-            # Standard servos (1,2,3,4,6) have 0-180° range
-            angle = int((180 - 0) * (pos - 900) / (3100 - 900) + 0)
-            if angle > 180 or angle < 0:
-                return None
+            # Standard servos (1,2,3,4,6) have 0-180 degree range
+            span_min, span_max, span_deg = (
+                ArmController.SERVO_MIN, ArmController.SERVO_MAX, 180)
+
+        angle = span_deg * (pos - span_min) / (span_max - span_min)
+
+        # Out-of-range policy: a reading a little past an endpoint is a real
+        # position (a joint parked slightly beyond its calibrated span), while
+        # a reading far outside it is a bad sample. Clamp the first, reject the
+        # second, so callers always get either a trustworthy angle or None.
+        if -ArmController.RANGE_TOLERANCE_DEG <= angle <= span_deg + ArmController.RANGE_TOLERANCE_DEG:
+            angle = int(round(min(max(angle, 0), span_deg)))
+        else:
+            print(f"[ArmController] servo {servo_id} position {pos} maps to "
+                  f"{angle:.1f} deg, outside 0-{span_deg} - discarding")
+            return None
 
         # Servos 2,3,4 are mechanically reversed - invert the angle
         if servo_id in [2, 3, 4]:
