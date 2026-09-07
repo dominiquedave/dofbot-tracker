@@ -90,6 +90,32 @@ cd /root/catkin_ws && catkin_make && source devel/setup.bash
 roslaunch dofbot_tracker arm_tracker.launch
 ```
 
+## Development workflow
+
+**The host is where code lives. The container is where code runs.**
+`~/robot` is mounted at `/root/robot`, so there is no copy step — edit on the
+host, re-run in the container.
+
+```bash
+bash ~/Docker_Ros.sh     # start-or-enter the container; links packages; shell
+```
+
+Three rules that are easy to get wrong:
+
+1. **Never author files from inside the container.** It runs as root, so
+   anything it creates under `/root/robot` lands on the host owned by
+   `root:root` and cannot be edited or committed as `pi`. Use
+   `~/robot/new-package.sh` rather than `catkin_create_pkg`.
+2. **ROS is only sourced in interactive shells.** `docker exec dofbot rostopic
+   list` fails; `docker exec dofbot bash -ic 'rostopic list'` works.
+3. **`pkill -f YahboomArm` before driving servos.** The vendor service also
+   writes I2C `0x15`, and I2C reports no error for two writers — the arm just
+   fights itself.
+
+Commit and push from the host. Full workflow, debugging tools and container
+details: [dofbot-workspace](https://github.com/dominiquedave/dofbot-workspace)
+(also at `~/robot/README.md`), and `~/CLAUDE.md` for hardware specifics.
+
 ## Usage
 
 Run inside the `dofbot` container (`bash ~/Docker_Ros.sh`).
